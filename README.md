@@ -146,6 +146,26 @@ At least one of `message`, `mediaContent`, or `html` must be provided.
 - `IMAGE_RETENTION_DAYS`: Number of days to keep images before deletion (default: 1)
 - `MAX_BATCH_SIZE`: Maximum number of messages in a batch request (default: 1000)
 - `MESSAGE_DELAY_MS`: Delay between messages in batch mode (default: 5000ms)
+- `WA_CONNECT_WAIT_MS`: How long a send waits for WhatsApp to reconnect (default: 30000ms)
+- `WA_SEND_TIMEOUT_MS`: A single send taking longer than this counts as failed (default: 120000ms)
+- `WA_MAX_DOWNTIME_MS`: Down longer than this, the process exits so pm2 restarts it (default: 600000ms)
+- `ALERT_WEBHOOK_URL`: Optional Slack/Discord webhook for alerts that need a human (logout, forced restart)
+
+## Staying Connected
+
+The bot recovers on its own from dropped connections, dead sockets, stuck reconnects and long outages (pm2 restart). Restarts and deploys never log it out.
+
+Only one case needs a person: WhatsApp unlinking the device (removed from the phone, or the phone offline for ~14 days). When that happens the bot backs up the old session, sends an alert and waits for a re-link:
+
+- **QR:** open `/api/qr?key=<API_KEY>` in a browser, then on the phone go to Linked devices → Link a device and scan.
+- **No camera:** open `/api/pair?key=<API_KEY>&phone=<countrycode+number>` and enter the code on the phone under Linked devices → Link a device → Link with phone number instead.
+
+Monitor `/api/status`: it returns 503 when disconnected, and `needsQrScan: true` when a re-link is needed.
+
+Deploy notes:
+- Run a single pm2 instance only (`pm2 start pm2.config.js`). Two processes sharing `baileys_auth` kick each other off.
+- Never copy `baileys_auth` between machines.
+- Keep the primary phone online at least once every ~14 days.
 
 ## License
 

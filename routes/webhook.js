@@ -1,8 +1,21 @@
 const express = require('express');
 const fs = require('fs');
 const { htmlToImage } = require('../utils/imageUtils');
-const { getWhatsAppClient } = require('../whatsappclient');
+const { getWhatsAppClient, waitForWhatsAppClient, requestHealthCheck } = require('../whatsappclient');
 const logger = console;
+
+// How long a send waits for WhatsApp to (re)connect before giving up
+const CONNECT_WAIT_MS = parseInt(process.env.WA_CONNECT_WAIT_MS || '30000');
+// A send stuck longer than this is treated as failed so a batch never hangs forever
+const SEND_TIMEOUT_MS = parseInt(process.env.WA_SEND_TIMEOUT_MS || '120000');
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 // Create router
 const router = express.Router();
@@ -113,14 +126,21 @@ async function downloadFromUrl(url) {
 }
 
 /**
- * Send message with retry logic
+ * Send message with retry logic.
+ * Resolves the current socket on every attempt — the socket is replaced on
+ * reconnect, so a reference captured earlier (e.g. at batch start) goes stale.
  */
-async function sendMessageWithRetry(client, groupId, message, options = {}) {
+async function sendMessageWithRetry(groupId, message, options = {}) {
   const MAX_RETRIES = 3;
   let lastError = null;
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
+      const client = await waitForWhatsAppClient(CONNECT_WAIT_MS);
+      if (!client) {
+        throw new Error('WhatsApp client is not connected');
+      }
+
       // Ensure groupId has correct format (should end with @g.us for groups or @s.whatsapp.net for individuals)
       let formattedGroupId = groupId;
       if (!groupId.includes('@')) {
@@ -129,11 +149,19 @@ async function sendMessageWithRetry(client, groupId, message, options = {}) {
       }
 
       // Send message using Baileys
-      const result = await client.sendMessage(formattedGroupId, message, options);
+      const result = await withTimeout(
+        client.sendMessage(formattedGroupId, message, options),
+        SEND_TIMEOUT_MS,
+        'sendMessage'
+      );
       return result;
     } catch (error) {
       lastError = error;
       logger.warn(`Attempt ${attempt}/${MAX_RETRIES} failed:`, error.message);
+
+      // Failure may mean the socket is silently dead — verify now; if dead, a
+      // reconnect starts and the next attempt waits for the new socket
+      await requestHealthCheck();
 
       if (attempt < MAX_RETRIES) {
         // Exponential backoff
@@ -165,8 +193,8 @@ router.post('/send', apiKeyAuth, async (req, res) => {
       });
     }
 
-    // Check if client is ready
-    const whatsappClient = getWhatsAppClient();
+    // Check if client is ready (waits out a short reconnect)
+    const whatsappClient = await waitForWhatsAppClient(CONNECT_WAIT_MS);
     if (!whatsappClient) {
       return res.status(503).json({
         success: false,
@@ -247,10 +275,10 @@ router.post('/send', apiKeyAuth, async (req, res) => {
 
     // Send message with or without media
     if (messageContent) {
-      await sendMessageWithRetry(whatsappClient, groupId, messageContent);
+      await sendMessageWithRetry(groupId, messageContent);
       logger.info(`Message with media sent to ${groupId}`);
     } else {
-      await sendMessageWithRetry(whatsappClient, groupId, { text: captionText });
+      await sendMessageWithRetry(groupId, { text: captionText });
       logger.info(`Text message sent to ${groupId}`);
     }
 
@@ -301,7 +329,7 @@ router.post('/send-batch', apiKeyAuth, async (req, res) => {
       });
     }
 
-    const whatsappClient = getWhatsAppClient();
+    const whatsappClient = await waitForWhatsAppClient(CONNECT_WAIT_MS);
     if (!whatsappClient) {
       logger.error('WhatsApp client is not ready');
       return res.status(503).json({
@@ -407,10 +435,10 @@ router.post('/send-batch', apiKeyAuth, async (req, res) => {
         // Send message with retry mechanism
         try {
           if (messageContent) {
-            await sendMessageWithRetry(whatsappClient, groupId, messageContent);
+            await sendMessageWithRetry(groupId, messageContent);
             logger.info(`Message ${i+1}/${messages.length} with media sent to ${groupId}`);
           } else {
-            await sendMessageWithRetry(whatsappClient, groupId, { text: captionText });
+            await sendMessageWithRetry(groupId, { text: captionText });
             logger.info(`Text message ${i+1}/${messages.length} sent to ${groupId}`);
           }
 
